@@ -1,45 +1,50 @@
-from fastapi import FastAPI, File, UploadFile
-from fastapi.middleware.cors import CORSMiddleware
-from ultralytics import YOLO
-from PIL import Image
+"""FastAPI application with an injectable, lazily loaded detector."""
 import io
+from functools import lru_cache
+from pathlib import Path
 
-app = FastAPI()
+from fastapi import Depends, FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from PIL import Image, UnidentifiedImageError
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-model = YOLO("yolo_model.pt")
+@lru_cache(maxsize=1)
+def get_model():
+    from ultralytics import YOLO
+    return YOLO(str(Path(__file__).with_name("yolo_model.pt")))
 
-@app.post("/detect")
-async def detect_objects(file: UploadFile = File(...)):
-    # 1. 读取前端上传的图片
-    image_data = await file.read()
-    image = Image.open(io.BytesIO(image_data))
 
-    # 2. 进行推理
-    results = model(image)
+def create_app():
+    application = FastAPI()
+    application.add_middleware(
+        CORSMiddleware, allow_origins=["*"], allow_credentials=True,
+        allow_methods=["*"], allow_headers=["*"],
+    )
 
-    # 3. 提取识别结果（只提取类别名称，去重）
-    detected_objects = []
-    for result in results:
-        for box in result.boxes:
-            class_id = int(box.cls[0])
-            class_name = model.names[class_id]
-            if class_name not in detected_objects:
-                detected_objects.append(class_name)
+    @application.post("/detect")
+    async def detect_objects(file: UploadFile = File(...), model=Depends(get_model)):
+        try:
+            image = Image.open(io.BytesIO(await file.read()))
+            image.load()
+        except (UnidentifiedImageError, OSError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="Invalid image") from exc
+        finally:
+            await file.close()
+        try:
+            objects = []
+            for result in model(image):
+                for box in result.boxes:
+                    name = model.names[int(box.cls[0])]
+                    if name not in objects:
+                        objects.append(name)
+            return {"status": "success", "objects": objects, "count": len(objects)}
+        finally:
+            image.close()
 
-    # 4. 返回JSON格式的清单给前端
-    return {
-        "status": "success",
-        "objects": detected_objects,
-        "count": len(detected_objects)
-    }
+    return application
+
+
+app = create_app()
 
 if __name__ == "__main__":
     import uvicorn
